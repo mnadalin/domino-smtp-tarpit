@@ -58,7 +58,7 @@ Reload the SMTP task:
 You should see this in the Domino console / log:
 
 ```
-SMTP Tarpit: extension loaded successfully
+SMTP Tarpit: extension version 1.0.0 loaded successfully
 ```
 
 To confirm it is working, connect with telnet and observe the delay before the `220` banner appears:
