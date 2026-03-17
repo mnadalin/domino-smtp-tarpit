@@ -19,14 +19,14 @@ make DOMINO_DIR=/opt/hcl/domino/notes/14050000/linux \
      CAPI_INC=/opt/hcl/notesapi/include
 ```
 
-Both variables have defaults matching common installation paths; override only what differs on your system. The output is `libsmtp_tarpit.so`.
+Both variables have defaults matching common installation paths; override only what differs on your system. The output is `libsmtp-tarpit.so`.
 
 ## Deploying
 
 Copy the shared library into Domino's program directory:
 
 ```bash
-cp libsmtp_tarpit.so /opt/hcl/domino/notes/14050000/linux/
+cp libsmtp-tarpit.so /opt/hcl/domino/notes/14050000/linux/
 ```
 
 ## Configuration
@@ -35,7 +35,7 @@ Add the following to your Domino `notes.ini` (or via the server console with `se
 
 ```ini
 # Load the extension
-EXTMGR_ADDINS=smtp_tarpit
+EXTMGR_ADDINS=smtp-tarpit
 
 # Tarpit duration in seconds (0 or missing = disabled)
 SMTPTarpitDelay=5
@@ -44,7 +44,7 @@ SMTPTarpitDelay=5
 If `EXTMGR_ADDINS` already has other entries, append with a comma:
 
 ```ini
-EXTMGR_ADDINS=existing_addin,smtp_tarpit
+EXTMGR_ADDINS=existing_addin,smtp-tarpit
 ```
 
 ## Verifying
@@ -77,7 +77,7 @@ Changes to the `SMTPTarpitDelay` parameter take effect immediately without requi
 
 ## Unloading
 
-Remove `smtp_tarpit` from `EXTMGR_ADDINS` in `notes.ini` and restart the SMTP task.
+Remove `smtp-tarpit` from `EXTMGR_ADDINS` in `notes.ini` and restart the SMTP task.
 
 # Disclaimer
 
