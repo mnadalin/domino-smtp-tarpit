@@ -47,6 +47,18 @@ If `EXTMGR_ADDINS` already has other entries, append with a comma:
 EXTMGR_ADDINS=existing_addin,smtp-tarpit
 ```
 
+### Exclusions
+
+Hosts listed in the **anti-relay exclusion list** (`SMTPRlyExcpts` field of the Server Configuration document in `names.nsf`) are automatically bypassed — the tarpit delay is not applied to them. This honours the same list used by Domino's built-in anti-relay enforcement.
+
+> **Note:** exclusions are only evaluated when anti-relay enforcement is active. If enforcement is set to *None*, the exclusion list is ignored and the tarpit applies to all connecting hosts.
+
+The exclusion list is loaded once at startup. To pick up changes, restart the SMTP task:
+
+```
+> restart task smtp
+```
+
 ## Verifying
 
 Reload the SMTP task:
@@ -58,7 +70,7 @@ Reload the SMTP task:
 You should see this in the Domino console / log:
 
 ```
-SMTP Tarpit: extension version 1.0.0 loaded successfully
+SMTP Tarpit: extension version 1.1.0 loaded successfully
 ```
 
 To confirm it is working, connect with telnet and observe the delay before the `220` banner appears:
@@ -70,7 +82,7 @@ telnet your-domino-server 25
 Disconnection events are also logged:
 
 ```
-SMTP Tarpit: client 192.0.2.1 disconnected during delay, dropping connection
+SMTP Tarpit: 192.0.2.1 disconnected after [n] second(s), dropping connection
 ```
 
 Changes to the `SMTPTarpitDelay` parameter take effect immediately without requiring an SMTP task restart.
@@ -78,6 +90,22 @@ Changes to the `SMTPTarpitDelay` parameter take effect immediately without requi
 ## Unloading
 
 Remove `smtp-tarpit` from `EXTMGR_ADDINS` in `notes.ini` and restart the SMTP task.
+
+## Diagnostic logging
+
+Set `DEBUG_SMTPTarpit` in `notes.ini` to enable additional log output:
+
+| Value | Effect |
+|-------|--------|
+| `0` (default) | Normal operation — only standard connection messages are logged |
+| `1` | **Debug** — also logs server name resolution, exclusion list loading, and which configuration document was matched |
+| `2` | **Trace** — logs every internal step (API calls, return codes, VARARG reads). Very verbose; use only when diagnosing a specific problem |
+
+```ini
+DEBUG_SMTPTarpit=1
+```
+
+The value is read once at the first log call and cached for the lifetime of the extension. To change it, restart the SMTP task.
 
 # Disclaimer
 
