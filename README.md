@@ -85,7 +85,11 @@ Disconnection events are also logged:
 SMTP Tarpit: 192.0.2.1 disconnected after [n] second(s), dropping connection
 ```
 
-Changes to the `SMTPTarpitDelay` parameter take effect immediately without requiring an SMTP task restart.
+The value of `SMTPTarpitDelay` is read once when the extension loads and cached for the lifetime of the SMTP task. To change it, restart the SMTP task:
+
+```
+> restart task smtp
+```
 
 ## Unloading
 
@@ -105,7 +109,7 @@ Set `DEBUG_SMTPTarpit` in `notes.ini` to enable additional log output:
 DEBUG_SMTPTarpit=1
 ```
 
-The value is read once at the first log call and cached for the lifetime of the extension. To change it, restart the SMTP task.
+The value is read once when the extension loads and cached for the lifetime of the SMTP task. To change it, restart the SMTP task.
 
 # Disclaimer
 

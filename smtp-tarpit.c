@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -20,7 +22,13 @@
 
 static HEMREGISTRATION g_hReg = NULLHANDLE;
 
-#define VERSION "1.1.0"
+/* DEBUG_SMTPTarpit / SMTPTarpitDelay are read once from notes.ini in
+ * MainEntryPoint and cached for the lifetime of the SMTP task; a
+ * 'restart task smtp' is required to pick up a changed value. */
+static int g_debugLevel  = 0; /* LOG_INFO */
+static int g_tarpitDelay = 0;
+
+#define VERSION "1.2.0"
 
 /* -----------------------------------------------------------------------
  * Server Configuration document fields (names.nsf).
@@ -62,14 +70,10 @@ static BOOL g_exclLoaded = FALSE;
 
 static void SmtpTarpitLogMessageText(int level, const char *fmt, ...)
 {
-    static int  debugLevel = -1;
-    static char buf[512];
+    char        buf[512];
     va_list     ap;
 
-    if (debugLevel < 0)
-        debugLevel = (int)OSGetEnvironmentInt("DEBUG_SMTPTarpit");
-
-    if (level > debugLevel) return;
+    if (level > g_debugLevel) return;
 
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -478,7 +482,7 @@ static BOOL MatchExcludeEntry(const char *entry,
                                const char *remoteIP,
                                const char *remoteHost)
 {
-    static char pat[EXCLUDE_LEN];
+    char        pat[EXCLUDE_LEN];
     const char *p = entry;
 
     if (*p == '[')
@@ -616,9 +620,11 @@ static void SmtpFmtClientMsg(char *buf, size_t bufsz,
                               const char *remoteHost, const char *remoteIP,
                               const char *fmt, ...)
 {
-    static char label[256];
-    static char fmtbuf[768];
+    char        label[256];
+    char        labelEsc[512];
+    char        fmtbuf[768];
     const char *pct;
+    size_t      li, ei;
     va_list     ap;
 
     if (remoteHost && remoteHost[0] != '\0')
@@ -628,10 +634,22 @@ static void SmtpFmtClientMsg(char *buf, size_t bufsz,
         snprintf(label, sizeof(label), "%s",
                  remoteIP ? remoteIP : "unknown");
 
+    /* remoteHost/remoteIP come from the connecting client (reverse DNS,
+     * TCP peer address) and are spliced into the format string below.
+     * Double up '%' so the client cannot inject conversion specifiers
+     * (e.g. a PTR record containing "%n") into vsnprintf's format. */
+    for (li = 0, ei = 0; label[li] != '\0' && ei + 2 < sizeof(labelEsc); li++)
+    {
+        if (label[li] == '%')
+            labelEsc[ei++] = '%';
+        labelEsc[ei++] = label[li];
+    }
+    labelEsc[ei] = '\0';
+
     pct = strstr(fmt, "%s");
     if (pct)
         snprintf(fmtbuf, sizeof(fmtbuf), "%.*s%s%s",
-                 (int)(pct - fmt), fmt, label, pct + 2);
+                 (int)(pct - fmt), fmt, labelEsc, pct + 2);
     else
         snprintf(fmtbuf, sizeof(fmtbuf), "%s", fmt);
 
@@ -647,6 +665,9 @@ STATUS LNPUBLIC MainEntryPoint(void)
     STATUS err;
     WORD   recursionID = 0;
 
+    g_debugLevel  = (int)OSGetEnvironmentInt("DEBUG_SMTPTarpit");
+    g_tarpitDelay = (int)OSGetEnvironmentInt("SMTPTarpitDelay");
+
     err = EMCreateRecursionID(&recursionID);
     if (err != NOERROR)
         return err;
@@ -661,7 +682,8 @@ STATUS LNPUBLIC MainEntryPoint(void)
         SmtpTarpitLogMessageText(LOG_INFO,
                  "SMTP Tarpit: extension version " VERSION " loaded successfully");
     else
-        SmtpTarpitLogMessageText(LOG_INFO, "SMTP Tarpit: EMRegister failed");
+        SmtpTarpitLogMessageText(LOG_INFO,
+                 "SMTP Tarpit: EMRegister failed (error 0x%04X)", err);
 
     return err;
 }
@@ -678,7 +700,7 @@ STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec)
     char          *greeting;
     DWORD          maxGreetingLength;
     struct timespec tick;
-    static char    msgbuf[512];
+    char           msgbuf[512];
 
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: callback entered");
 
@@ -690,7 +712,7 @@ STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec)
     }
 
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: step 1 - reading SMTPTarpitDelay");
-    delay = (int)OSGetEnvironmentInt("SMTPTarpitDelay");
+    delay = g_tarpitDelay;
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: step 1 done - delay=%d", delay);
     if (delay <= 0)
         return ERR_EM_CONTINUE;
