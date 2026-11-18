@@ -1,4 +1,4 @@
-DOMINO_DIR ?= /opt/hcl/domino/notes/14050000/linux
+DOMINO_DIR ?= /opt/hcl/domino/notes/14050100/linux
 CAPI_INC   ?= /opt/hcl/CAPIToolkit/include
 
 CC      = gcc
@@ -21,3 +21,9 @@ $(TARGET): $(SRC)
 
 clean:
 	rm -f $(TARGET)
+
+# Used by build.sh to deploy into the same directory the library links against.
+print-domino-dir:
+	@echo $(DOMINO_DIR)
+
+.PHONY: all clean print-domino-dir

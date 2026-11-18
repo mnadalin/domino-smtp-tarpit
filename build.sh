@@ -12,7 +12,12 @@ if [ ! -f libsmtp-tarpit.so ]; then
 	exit 1
 fi
 
-# Deploy
-rm -f /opt/hcl/domino/notes/14050000/linux/libsmtp-tarpit.so
-mv libsmtp-tarpit.so /opt/hcl/domino/notes/14050000/linux/
-echo "Deploy complete."
+# Deploy (DOMINO_DIR comes from the Makefile, or from the environment if set)
+DOMINO_DIR=$(make -s print-domino-dir)
+if [ -z "$DOMINO_DIR" ] || [ ! -d "$DOMINO_DIR" ]; then
+	echo "Domino directory not found: '$DOMINO_DIR'"
+	exit 1
+fi
+rm -f "$DOMINO_DIR/libsmtp-tarpit.so"
+mv libsmtp-tarpit.so "$DOMINO_DIR/"
+echo "Deploy complete ($DOMINO_DIR)."
