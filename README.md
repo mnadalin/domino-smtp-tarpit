@@ -53,7 +53,7 @@ Hosts listed in the **anti-relay exclusion list** (`SMTPRlyExcpts` field of the 
 
 > **Note:** exclusions are only evaluated when anti-relay enforcement is active. If enforcement is set to *None*, the exclusion list is ignored and the tarpit applies to all connecting hosts.
 
-The exclusion list is loaded once at startup. To pick up changes, restart the SMTP task:
+The exclusion list is loaded once, on the first incoming connection (if `names.nsf` cannot be read, the load is retried every 60 seconds). To pick up changes, restart the SMTP task:
 
 ```
 > restart task smtp
@@ -70,7 +70,7 @@ Reload the SMTP task:
 You should see this in the Domino console / log:
 
 ```
-SMTP Tarpit: extension version 1.1.0 loaded successfully
+SMTP Tarpit: extension version 1.2.2 loaded successfully
 ```
 
 To confirm it is working, connect with telnet and observe the delay before the `220` banner appears:

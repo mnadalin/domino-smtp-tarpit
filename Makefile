@@ -2,7 +2,7 @@ DOMINO_DIR ?= /opt/hcl/domino/notes/14050000/linux
 CAPI_INC   ?= /opt/hcl/CAPIToolkit/include
 
 CC      = gcc
-CFLAGS  = -shared -fPIC -O2 -Wall \
+CFLAGS  = -shared -fPIC -O2 -Wall -pthread \
           -I$(CAPI_INC) \
           -DGCC4 \
           -DUNIX -DND64 -DNDUNIX \

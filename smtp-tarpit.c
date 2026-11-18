@@ -1,4 +1,9 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* POLLRDHUP */
+#endif
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -10,6 +15,9 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <errno.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <sys/resource.h>
 #include "global.h"
 #include "extmgr.h"
 #include "nsferr.h"
@@ -28,7 +36,7 @@ static HEMREGISTRATION g_hReg = NULLHANDLE;
 static int g_debugLevel  = 0; /* LOG_INFO */
 static int g_tarpitDelay = 0;
 
-#define VERSION "1.2.0"
+#define VERSION "1.2.2"
 
 /* -----------------------------------------------------------------------
  * Server Configuration document fields (names.nsf).
@@ -51,9 +59,17 @@ static int g_tarpitDelay = 0;
 #define MAX_EXCLUDE   256
 #define EXCLUDE_LEN   256
 
-static char g_excl[MAX_EXCLUDE][EXCLUDE_LEN];
-static int  g_exclCount  = 0;
-static BOOL g_exclLoaded = FALSE;
+/* Seconds to wait before retrying a failed exclusion-list load. */
+#define EXCLUDE_RETRY_SECS 60
+
+/* g_excl / g_exclCount / g_exclLoaded / g_exclLastTry are protected by
+ * g_exclMutex.  The list is loaded once (on the first connection) and is
+ * read-only afterwards; a failed load is retried after EXCLUDE_RETRY_SECS. */
+static pthread_mutex_t g_exclMutex = PTHREAD_MUTEX_INITIALIZER;
+static char   g_excl[MAX_EXCLUDE][EXCLUDE_LEN];
+static int    g_exclCount   = 0;
+static BOOL   g_exclLoaded  = FALSE;
+static time_t g_exclLastTry = 0;
 
 /* -----------------------------------------------------------------------
  * Unified log function.  Pass one of the LOG_* constants as level.
@@ -212,9 +228,14 @@ static void AbbrevToCanonical(const char *abbrev, char *canonical, size_t canonS
  *   4. If SMTPRlyCheck == "2" (None), treat the list as empty.
  *      Otherwise read SMTPRlyExcpts into the cache.
  *
- * Configuration changes take effect after "tell smtp restart".
+ * Configuration changes take effect after "restart task smtp".
+ *
+ * Must be called with g_exclMutex held (the static buffers below are
+ * shared).  Returns TRUE when names.nsf was read successfully (even if no
+ * Server Configuration document matched), FALSE on a hard error so the
+ * caller can retry later.
  * ----------------------------------------------------------------------- */
-static void LoadExcludeList(void)
+static BOOL LoadExcludeList(void)
 {
     static char abbrev[MAXUSERNAME + 1];
     static char canonical[MAXUSERNAME + 1];
@@ -231,16 +252,11 @@ static void LoadExcludeList(void)
     int         newCount;
     static char newExcl[MAX_EXCLUDE][EXCLUDE_LEN];
     STATUS      err;
-
-    /* Load once per extension lifetime.  Mark as loaded first so that
-     * concurrent connections don't all race to load simultaneously;
-     * worst case two threads load in parallel and write identical data. */
-    if (g_exclLoaded) return;
-    g_exclLoaded = TRUE;
+    BOOL        ok = TRUE;
 
     /* Build both forms of the server name.
-     * DNCanonicalize converts "DominoS1/Devangarde" → "CN=DominoS1/O=Devangarde".
-     * On failure (unexpected format) fall back to the abbreviated form only. */
+     * AbbrevToCanonical converts "DominoS1/Devangarde" → "CN=DominoS1/O=Devangarde".
+     * The abbreviated form is also tried as a fallback lookup key. */
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: LoadExcludeList: step 1 - reading ServerName");
     abbrev[0] = canonical[0] = '\0';
     OSGetEnvironmentString("ServerName", abbrev, sizeof(abbrev) - 1);
@@ -269,8 +285,10 @@ static void LoadExcludeList(void)
              "SMTP Tarpit [trace]: LoadExcludeList: NSFDbOpen err=0x%04X", (unsigned)err);
     if (err != NOERROR)
     {
-        g_exclCount = 0;
-        return;
+        SmtpTarpitLogMessageText(LOG_INFO,
+                 "SMTP Tarpit: cannot open names.nsf (error 0x%04X), exclusion list not loaded",
+                 (unsigned)err);
+        return FALSE;
     }
 
     SmtpTarpitLogMessageText(LOG_TRACE,
@@ -281,11 +299,11 @@ static void LoadExcludeList(void)
              (unsigned)err, (unsigned long)viewNoteID);
     if (err != NOERROR)
     {
-        SmtpTarpitLogMessageText(LOG_DEBUG,
-                 "SMTP Tarpit [debug]: view %s not found in names.nsf", SERVERCONFIG_VIEW);
+        SmtpTarpitLogMessageText(LOG_INFO,
+                 "SMTP Tarpit: view %s not found in names.nsf (error 0x%04X), exclusion list not loaded",
+                 SERVERCONFIG_VIEW, (unsigned)err);
         NSFDbClose(hDb);
-        g_exclCount = 0;
-        return;
+        return FALSE;
     }
 
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: LoadExcludeList: step 5 - opening collection");
@@ -295,9 +313,11 @@ static void LoadExcludeList(void)
              "SMTP Tarpit [trace]: LoadExcludeList: NIFOpenCollection err=0x%04X", (unsigned)err);
     if (err != NOERROR)
     {
+        SmtpTarpitLogMessageText(LOG_INFO,
+                 "SMTP Tarpit: cannot open view %s (error 0x%04X), exclusion list not loaded",
+                 SERVERCONFIG_VIEW, (unsigned)err);
         NSFDbClose(hDb);
-        g_exclCount = 0;
-        return;
+        return FALSE;
     }
 
     /* Try canonical name → abbreviated name → wildcard document.
@@ -383,10 +403,22 @@ static void LoadExcludeList(void)
                 SmtpTarpitLogMessageText(LOG_TRACE,
                          "SMTP Tarpit [trace]: LoadExcludeList: NSFItemConvertToText returned %u bytes",
                          (unsigned)textlen);
+                /* A full buffer means the item text was truncated: the last
+                 * entry may be cut in half, so drop it rather than match
+                 * against a partial pattern. */
+                if (textlen >= sizeof(textbuf) - 1)
+                {
+                    char *last = strrchr(textbuf, '\n');
+                    if (last) *last = '\0';
+                    else      textbuf[0] = '\0';
+                    SmtpTarpitLogMessageText(LOG_INFO,
+                             "SMTP Tarpit: %s exceeds %u bytes, list truncated",
+                             SERVERCONFIG_FIELD, (unsigned)(sizeof(textbuf) - 1));
+                }
                 if (textlen > 0)
                 {
                     p = textbuf;
-                    while (p && *p && newCount < MAX_EXCLUDE)
+                    while (p && *p)
                     {
                         sep = strchr(p, '\n');
                         if (sep) *sep = '\0';
@@ -398,10 +430,25 @@ static void LoadExcludeList(void)
                             while (e > p && isspace((unsigned char)*e))
                                 *e-- = '\0';
                         }
+                        if (*p && newCount >= MAX_EXCLUDE)
+                        {
+                            SmtpTarpitLogMessageText(LOG_INFO,
+                                     "SMTP Tarpit: %s has more than %d entries, extra entries ignored",
+                                     SERVERCONFIG_FIELD, MAX_EXCLUDE);
+                            break;
+                        }
                         if (*p)
                         {
-                            strncpy(newExcl[newCount], p, EXCLUDE_LEN - 1);
-                            newExcl[newCount][EXCLUDE_LEN - 1] = '\0';
+                            size_t len = strlen(p);
+                            if (len >= EXCLUDE_LEN)
+                            {
+                                SmtpTarpitLogMessageText(LOG_INFO,
+                                         "SMTP Tarpit: %s entry longer than %d chars truncated",
+                                         SERVERCONFIG_FIELD, EXCLUDE_LEN - 1);
+                                len = EXCLUDE_LEN - 1;
+                            }
+                            memcpy(newExcl[newCount], p, len);
+                            newExcl[newCount][len] = '\0';
                             newCount++;
                         }
                         p = sep ? sep + 1 : NULL;
@@ -421,6 +468,13 @@ static void LoadExcludeList(void)
             NSFNoteClose(hNote);
             SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: LoadExcludeList: note closed");
         }
+        else
+        {
+            SmtpTarpitLogMessageText(LOG_INFO,
+                     "SMTP Tarpit: cannot open Server Configuration note %08lX (error 0x%04X)",
+                     (unsigned long)noteID, (unsigned)err);
+            ok = FALSE;
+        }
     }
 
     SmtpTarpitLogMessageText(LOG_TRACE,
@@ -428,8 +482,13 @@ static void LoadExcludeList(void)
     NSFDbClose(hDb);
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: LoadExcludeList: names.nsf closed");
 
-    g_exclCount = newCount;
+    if (!ok)
+        return FALSE;
+
+    /* Publish the entries before the count (caller holds g_exclMutex). */
     memcpy(g_excl, newExcl, (size_t)newCount * sizeof(g_excl[0]));
+    g_exclCount = newCount;
+    return TRUE;
 }
 
 /* -----------------------------------------------------------------------
@@ -511,10 +570,28 @@ static BOOL MatchExcludeEntry(const char *entry,
  * ----------------------------------------------------------------------- */
 static BOOL SmtpTarpitIsExcluded(const char *remoteIP, const char *remoteHost)
 {
-    int i;
+    int    i;
+    BOOL   excluded = FALSE;
+    time_t now;
+
+    /* Hold the mutex for load + match: the match loop is cheap (at most
+     * MAX_EXCLUDE short strings) and this guarantees a connection arriving
+     * during the initial load waits for the list instead of seeing it empty. */
+    pthread_mutex_lock(&g_exclMutex);
 
     if (!g_exclLoaded)
-        LoadExcludeList();
+    {
+        now = time(NULL);
+        if (g_exclLastTry == 0 || now - g_exclLastTry >= EXCLUDE_RETRY_SECS)
+        {
+            g_exclLastTry = now;
+            g_exclLoaded  = LoadExcludeList();
+            if (!g_exclLoaded)
+                SmtpTarpitLogMessageText(LOG_INFO,
+                         "SMTP Tarpit: exclusion list load failed, retrying in %d seconds",
+                         EXCLUDE_RETRY_SECS);
+        }
+    }
 
     for (i = 0; i < g_exclCount; i++)
     {
@@ -525,10 +602,95 @@ static BOOL SmtpTarpitIsExcluded(const char *remoteIP, const char *remoteHost)
                      remoteHost && remoteHost[0] ? remoteHost : "unknown",
                      remoteIP   && remoteIP[0]   ? remoteIP   : "unknown",
                      g_excl[i]);
-            return TRUE;
+            excluded = TRUE;
+            break;
         }
     }
-    return FALSE;
+
+    pthread_mutex_unlock(&g_exclMutex);
+    return excluded;
+}
+
+/*
+ * Normalise an IP address string for comparison: an IPv4-mapped IPv6
+ * address ("::ffff:1.2.3.4", as seen on dual-stack listeners) is reduced
+ * to its dotted-quad form ("1.2.3.4").  Anything else is copied as-is.
+ */
+static void NormalizeIP(const char *in, char *out, size_t outsz)
+{
+    if (!in) { out[0] = '\0'; return; }
+    if (strncasecmp(in, "::ffff:", 7) == 0 && strchr(in + 7, '.') != NULL)
+        in += 7;
+    snprintf(out, outsz, "%s", in);
+}
+
+/* Upper bound for the fallback fd scan when /proc/self/fd is unavailable. */
+#define FD_SCAN_MAX 65536
+
+/*
+ * Check whether fd is a socket connected to remoteIP (already normalised).
+ * Returns -1 if it is not, 1 if it is and the peer looks connected,
+ * 0 if it is and the peer has closed the connection (FIN or RST).
+ */
+static int ProbeClientFd(int fd, const char *remoteIP)
+{
+    struct sockaddr_storage peer;
+    socklen_t               peerlen = sizeof(peer);
+    char                    ipbuf[INET6_ADDRSTRLEN];
+    struct pollfd           pfd;
+    char                    probe;
+    ssize_t                 n;
+    int                     pr;
+
+    if (getpeername(fd, (struct sockaddr *)&peer, &peerlen) != 0)
+        return -1;
+
+    ipbuf[0] = '\0';
+    if (peer.ss_family == AF_INET)
+    {
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&peer)->sin_addr,
+                  ipbuf, sizeof(ipbuf));
+    }
+    else if (peer.ss_family == AF_INET6)
+    {
+        const struct in6_addr *a6 = &((struct sockaddr_in6 *)&peer)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(a6))
+            inet_ntop(AF_INET, &a6->s6_addr[12], ipbuf, sizeof(ipbuf));
+        else
+            inet_ntop(AF_INET6, a6, ipbuf, sizeof(ipbuf));
+    }
+    else
+        return -1;
+
+    if (strcmp(ipbuf, remoteIP) != 0)
+        return -1;
+
+    pfd.fd      = fd;
+    pfd.events  = POLLIN;
+#ifdef POLLRDHUP
+    /* Reports the peer's FIN even when unread data is still queued
+     * (a client that sent something and then hung up). */
+    pfd.events |= POLLRDHUP;
+#endif
+    pfd.revents = 0;
+    pr = poll(&pfd, 1, 0);
+    if (pr < 0)
+        return 1;           /* cannot tell: assume alive */
+    if (pr == 0)
+        return 1;           /* nothing pending: idle but connected */
+    if (pfd.revents & (POLLHUP | POLLERR))
+        return 0;
+#ifdef POLLRDHUP
+    if (pfd.revents & POLLRDHUP)
+        return 0;
+#endif
+
+    n = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0)
+        return 1;           /* client already sent data (early talker) */
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return 1;
+    return 0;               /* n == 0 (FIN) or hard error (RST) */
 }
 
 /*
@@ -536,72 +698,56 @@ static BOOL SmtpTarpitIsExcluded(const char *remoteIP, const char *remoteHost)
  * peer matches remoteIP, then do a non-blocking peek to decide whether the
  * client is still connected.
  *
+ * The EM_SMTPCONNECT record does not expose the socket, so the match is by
+ * peer IP only: when several connections from the same IP are open, the
+ * client is considered alive as long as any of them is.
+ *
  * Returns TRUE  if the client appears connected (or if we cannot determine
  *               its state — conservative default).
- * Returns FALSE if we find the socket and the peer has closed the connection
- *               (recv returns 0 for FIN, or -1 for RST / other hard error).
+ * Returns FALSE if we find the socket(s) and the peer has closed them.
  */
 static BOOL SmtpClientIsAlive(const char *remoteIP)
 {
-    int                     fd;
-    struct sockaddr_storage peer;
-    socklen_t               peerlen;
-    char                    ipbuf[INET6_ADDRSTRLEN];
-    struct pollfd           pfd;
-    char                    probe;
-    ssize_t                 n;
-    int                     pr;
-    BOOL                    found_any   = FALSE;
-    BOOL                    found_alive = FALSE;
+    DIR            *dir;
+    struct dirent  *de;
+    struct rlimit   rl;
+    int             fd, maxfd, r;
+    BOOL            found_any   = FALSE;
+    BOOL            found_alive = FALSE;
 
     if (!remoteIP || !remoteIP[0])
         return TRUE;
 
-    for (fd = 3; fd < 4096; fd++)
+    /* Preferred: enumerate only the fds that actually exist. */
+    dir = opendir("/proc/self/fd");
+    if (dir != NULL)
     {
-        peerlen = sizeof(peer);
-        if (getpeername(fd, (struct sockaddr *)&peer, &peerlen) != 0)
-            continue;
-
-        ipbuf[0] = '\0';
-        if (peer.ss_family == AF_INET)
-            inet_ntop(AF_INET,
-                      &((struct sockaddr_in *)&peer)->sin_addr,
-                      ipbuf, sizeof(ipbuf));
-        else if (peer.ss_family == AF_INET6)
-            inet_ntop(AF_INET6,
-                      &((struct sockaddr_in6 *)&peer)->sin6_addr,
-                      ipbuf, sizeof(ipbuf));
-        else
-            continue;
-
-        if (strcmp(ipbuf, remoteIP) != 0)
-            continue;
-
-        found_any = TRUE;
-
-        pfd.fd      = fd;
-        pfd.events  = POLLIN;
-        pfd.revents = 0;
-        pr = poll(&pfd, 1, 0);
-        if (pr < 0)
-            continue;
-        if (pr == 0)
+        int dfd = dirfd(dir);
+        while (!found_alive && (de = readdir(dir)) != NULL)
         {
-            found_alive = TRUE;
-            break;
+            char *end;
+            long  v = strtol(de->d_name, &end, 10);
+            if (*end != '\0' || end == de->d_name || v < 3 || v == dfd)
+                continue;
+            r = ProbeClientFd((int)v, remoteIP);
+            if (r < 0) continue;
+            found_any = TRUE;
+            if (r > 0) found_alive = TRUE;
         }
-
-        n = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
-        if (n > 0)
+        closedir(dir);
+    }
+    else
+    {
+        /* Fallback: brute-force scan up to the process fd limit. */
+        maxfd = 4096;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+            maxfd = rl.rlim_cur > FD_SCAN_MAX ? FD_SCAN_MAX : (int)rl.rlim_cur;
+        for (fd = 3; fd < maxfd && !found_alive; fd++)
         {
-            found_alive = TRUE;
-            break;
-        }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        {
-            found_alive = TRUE;
-            break;
+            r = ProbeClientFd(fd, remoteIP);
+            if (r < 0) continue;
+            found_any = TRUE;
+            if (r > 0) found_alive = TRUE;
         }
     }
 
@@ -701,6 +847,7 @@ STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec)
     DWORD          maxGreetingLength;
     struct timespec tick;
     char           msgbuf[512];
+    char           ipNorm[64];
 
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: callback entered");
 
@@ -747,11 +894,15 @@ STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec)
              (unsigned long)maxGreetingLength);
     va_end(ap);
 
+    /* "::ffff:1.2.3.4" → "1.2.3.4" so that [1.2.3.4] exclusions and the
+     * socket scan match on dual-stack listeners. */
+    NormalizeIP(remoteIP, ipNorm, sizeof(ipNorm));
+
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: step 9 - calling SmtpTarpitIsExcluded");
     /* Check whether this host is in the Server Configuration anti-relay
      * exclusion list (SMTPRlyExcpts).  The list is only honoured when
      * SMTPRlyCheck != "2" (i.e. anti-relay enforcement is active). */
-    if (SmtpTarpitIsExcluded(remoteIP, remoteHost))
+    if (SmtpTarpitIsExcluded(ipNorm, remoteHost))
     {
         SmtpTarpitLogMessageText(LOG_TRACE,
                  "SMTP Tarpit [trace]: step 9 - host is excluded, bypassing");
@@ -777,11 +928,11 @@ STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec)
         nanosleep(&tick, NULL);
 
         SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: step 11 - checking client alive");
-        if (!SmtpClientIsAlive(remoteIP))
+        if (!SmtpClientIsAlive(ipNorm))
         {
             SmtpFmtClientMsg(msgbuf, sizeof(msgbuf), remoteHost, remoteIP,
                              "SMTP Tarpit: %s disconnected after %d second(s), dropping connection",
-                             elapsed);
+                             elapsed + 1);
             SmtpTarpitLogMessageText(LOG_INFO, "%s", msgbuf);
             return ERR_NOACCESS;
         }
