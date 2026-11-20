@@ -6,6 +6,8 @@ An HCL Domino Extension Manager add-in that delays incoming SMTP connections bef
 
 The add-in registers a `EM_SMTPCONNECT` (before) hook. When an inbound SMTP connection arrives, the hook sleeps one second at a time — checking each second whether the remote client is still connected — until the configured delay expires, then lets Domino proceed normally. If the client disconnects early, the connection is dropped immediately.
 
+`EXTMGR_ADDINS` makes every Domino process load the library, but the extension is only active in the `smtp` task: in all other processes (`http`, `router`, `amgr`, …) it returns immediately without registering any hook or logging anything. In the `smtp` task the hook is deregistered when NSF services terminate (`EM_TERMINATENSF`).
+
 ## Requirements
 
 - HCL Domino 14+ (Linux, 64-bit)
@@ -70,8 +72,10 @@ Reload the SMTP task:
 You should see this in the Domino console / log:
 
 ```
-SMTP Tarpit: extension version 1.2.2 loaded successfully
+SMTP Tarpit: extension version 1.2.3 loaded successfully
 ```
+
+The message is logged once, by the `smtp` process only.
 
 To confirm it is working, connect with telnet and observe the delay before the `220` banner appears:
 
