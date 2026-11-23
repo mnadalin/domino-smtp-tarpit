@@ -6,7 +6,12 @@ An HCL Domino Extension Manager add-in that delays incoming SMTP connections bef
 
 The add-in registers a `EM_SMTPCONNECT` (before) hook. When an inbound SMTP connection arrives, the hook sleeps one second at a time — checking each second whether the remote client is still connected — until the configured delay expires, then lets Domino proceed normally. If the client disconnects early, the connection is dropped immediately.
 
-`EXTMGR_ADDINS` makes every Domino process load the library, but the extension is only active in the `smtp` task: in all other processes (`http`, `router`, `amgr`, …) it returns immediately without registering any hook or logging anything. In the `smtp` task the hook is deregistered when NSF services terminate (`EM_TERMINATENSF`).
+`EXTMGR_ADDINS` makes every Domino process load the library, but the extension is only active in the `smtp` task: in all other processes (`http`, `router`, `amgr`, …) it returns immediately without registering any hook or logging anything.
+
+Following the HCL C API rules for Extension Manager libraries:
+
+- the entry point only calls `EMCreateRecursionID` / `EMRegister` (no other C API calls while Domino is still initialising); `notes.ini` is read and the start-up message is logged on the first SMTP connection;
+- the hooks are deregistered when Domino unloads the library (library destructor, the Linux counterpart of `DLL_PROCESS_DETACH`), after the `EM_TERMINATENSF` notification — never from inside the `EM_TERMINATENSF` callback.
 
 ## Requirements
 
@@ -69,13 +74,13 @@ Reload the SMTP task:
 > restart task smtp
 ```
 
-You should see this in the Domino console / log:
+On the first incoming SMTP connection you should see this in the Domino console / log:
 
 ```
-SMTP Tarpit: extension version 1.2.3 loaded successfully
+SMTP Tarpit: extension version 1.2.4 active (delay 5 second(s))
 ```
 
-The message is logged once, by the `smtp` process only.
+The message is logged once per SMTP task start, by the `smtp` process only, and not at server start-up (see *How it works*).
 
 To confirm it is working, connect with telnet and observe the delay before the `220` banner appears:
 
@@ -113,7 +118,9 @@ Set `DEBUG_SMTPTarpit` in `notes.ini` to enable additional log output:
 DEBUG_SMTPTarpit=1
 ```
 
-The value is read once when the extension loads and cached for the lifetime of the SMTP task. To change it, restart the SMTP task.
+The value is read once, on the first SMTP connection, and cached for the lifetime of the SMTP task. To change it, restart the SMTP task.
+
+With `DEBUG_SMTPTarpit` ≥ 1 the deregistration performed when the `smtp` task unloads the library is also traced to `/tmp/smtp-tarpit-unload.log` (plain file, since the Domino log may no longer be available at that point). Each `EMDeregister(...) ...` line should be followed by its `= 0x0000` result line.
 
 # Disclaimer
 

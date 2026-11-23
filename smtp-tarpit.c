@@ -29,20 +29,26 @@
 #include "osmem.h"
 
 /* Extension Manager registrations, only ever made in the smtp process.
- * g_hReg is released from the EM_TERMINATENSF handler (see below). */
-static HEMREGISTRATION g_hReg     = NULLHANDLE;
-static HEMREGISTRATION g_hRegTerm = NULLHANDLE;
+ * Both are released by the library destructor (SmtpTarpitUnload), after
+ * EM_TERMINATENSF has announced the orderly unload. */
+static HEMREGISTRATION g_hReg           = NULLHANDLE;
+static HEMREGISTRATION g_hRegTerm       = NULLHANDLE;
+static volatile BOOL   g_nsfTerminating = FALSE;
 
 /* Name of the only process the extension is active in. */
 #define SMTP_PROCESS_NAME "smtp"
 
-/* DEBUG_SMTPTarpit / SMTPTarpitDelay are read once from notes.ini in
- * MainEntryPoint and cached for the lifetime of the SMTP task; a
- * 'restart task smtp' is required to pick up a changed value. */
+/* Written by the destructor when DEBUG_SMTPTarpit >= 1. */
+#define UNLOAD_TRACE_FILE "/tmp/smtp-tarpit-unload.log"
+
+/* DEBUG_SMTPTarpit / SMTPTarpitDelay are read once from notes.ini on the
+ * first SMTP connection (not in MainEntryPoint, see there) and cached for
+ * the lifetime of the SMTP task; a 'restart task smtp' is required to pick
+ * up a changed value. */
 static int g_debugLevel  = 0; /* LOG_INFO */
 static int g_tarpitDelay = 0;
 
-#define VERSION "1.2.3"
+#define VERSION "1.2.4"
 
 /* -----------------------------------------------------------------------
  * Server Configuration document fields (names.nsf).
@@ -845,21 +851,29 @@ static BOOL IsSmtpProcess(void)
     return (base != NULL && strcmp(base, SMTP_PROCESS_NAME) == 0);
 }
 
+/* -----------------------------------------------------------------------
+ * Extension Manager entry point.
+ *
+ * HCL C API rule: "Do not make any C API function calls for Domino and
+ * Notes, other than the extension manager EMxxx function calls, in the
+ * entry point routine that calls EMRegister" — Notes is not fully
+ * initialised yet.  So this routine only checks the process name (plain
+ * libc) and calls EMCreateRecursionID / EMRegister.  Reading notes.ini and
+ * the "loaded" log message are deferred to the first SMTP connection
+ * (SmtpTarpitLazyInit).
+ * ----------------------------------------------------------------------- */
 STATUS LNPUBLIC MainEntryPoint(void)
 {
     STATUS err;
     WORD   recursionID = 0;
 
-    /* Stay completely inert outside the SMTP task: no registration, no
-     * notes.ini reads, no log messages. */
+    /* HCL: check the calling application before EMRegister.  Outside the
+     * SMTP task the library stays completely inert. */
     if (!IsSmtpProcess())
         return NOERROR;
 
     if (g_hReg != NULLHANDLE)   /* already initialised in this process */
         return NOERROR;
-
-    g_debugLevel  = (int)OSGetEnvironmentInt("DEBUG_SMTPTarpit");
-    g_tarpitDelay = (int)OSGetEnvironmentInt("SMTPTarpitDelay");
 
     err = EMCreateRecursionID(&recursionID);
     if (err != NOERROR)
@@ -873,54 +887,137 @@ STATUS LNPUBLIC MainEntryPoint(void)
     if (err != NOERROR)
     {
         g_hReg = NULLHANDLE;
-        SmtpTarpitLogMessageText(LOG_INFO,
-                 "SMTP Tarpit: EMRegister failed (error 0x%04X)", err);
         return err;
     }
 
-    /* Release the EM_SMTPCONNECT registration while NSF services are still
-     * up, instead of leaving it dangling until the library is unloaded.
-     * A failure here is not fatal: the tarpit itself works without it. */
+    /* Only used to learn that NSF is shutting down in an orderly way; the
+     * deregistration itself happens in the library destructor.  Not fatal
+     * if it fails: the destructor then skips EMDeregister (see below). */
     err = EMRegister(EM_TERMINATENSF,
                      EM_REG_BEFORE,
                      (EMHANDLER)SmtpTarpitTerminateCallback,
                      recursionID,
                      &g_hRegTerm);
     if (err != NOERROR)
-    {
         g_hRegTerm = NULLHANDLE;
-        SmtpTarpitLogMessageText(LOG_INFO,
-                 "SMTP Tarpit: EMRegister(EM_TERMINATENSF) failed (error 0x%04X)", err);
-    }
 
-    SmtpTarpitLogMessageText(LOG_INFO,
-             "SMTP Tarpit: extension version " VERSION " loaded successfully");
     return NOERROR;
 }
 
 /* -----------------------------------------------------------------------
- * EM_TERMINATENSF: NSF services are shutting down for the smtp process.
- * Deregister the EM_SMTPCONNECT handler here, while the Notes runtime is
- * still fully available.  The EM_TERMINATENSF registration itself is left
- * alone: deregistering the handler that is currently executing is not
- * documented as safe, and the Extension Manager discards it at shutdown.
+ * EM_TERMINATENSF: "occurs when NSF service terminates for the process,
+ * right before the extension manager DLLs are unloaded".
  *
- * This replaces the former TerminateLibrary(), which is not a C API hook
- * (Domino never calls it) and would have logged / called EMDeregister
- * after Notes had already terminated had anything invoked it.
+ * HCL C API rule: "Do not de-register callback functions in the callback
+ * routine for the EM_TERMINATENSF notification."  So this callback only
+ * records that the orderly unload sequence has started; the registrations
+ * are released by SmtpTarpitUnload() when the library is unloaded.
  * ----------------------------------------------------------------------- */
 STATUS LNCALLBACK SmtpTarpitTerminateCallback(EMRECORD *pRec)
 {
     (void)pRec;
+    g_nsfTerminating = TRUE;
+    SmtpTarpitLogMessageText(LOG_DEBUG,
+             "SMTP Tarpit [debug]: EM_TERMINATENSF received, registrations "
+             "will be released when the library is unloaded");
+    return ERR_EM_CONTINUE;
+}
+
+/* -----------------------------------------------------------------------
+ * Append one line to UNLOAD_TRACE_FILE (only when DEBUG_SMTPTarpit >= 1).
+ * Uses plain libc on purpose: during unload the Notes logging API must not
+ * be relied upon.  Used to verify on the server that the destructor runs
+ * and EMDeregister returns.
+ * ----------------------------------------------------------------------- */
+static void UnloadTrace(const char *fmt, ...)
+{
+    int     fd;
+    char    line[256];
+    int     n;
+    va_list ap;
+
+    if (g_debugLevel < LOG_DEBUG)
+        return;
+
+    n = snprintf(line, sizeof(line), "%ld pid=%ld ",
+                 (long)time(NULL), (long)getpid());
+    if (n < 0 || n >= (int)sizeof(line))
+        return;
+    va_start(ap, fmt);
+    vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
+    va_end(ap);
+
+    fd = open(UNLOAD_TRACE_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0)
+        return;
+    n = (int)strlen(line);
+    if (n < (int)sizeof(line) - 1) { line[n++] = '\n'; }
+    (void)!write(fd, line, (size_t)n);
+    close(fd);
+}
+
+/* -----------------------------------------------------------------------
+ * Library destructor: the Linux counterpart of DLL_PROCESS_DETACH, which
+ * is where the Windows C API samples call EMDeregister.
+ *
+ * HCL requires every registration to be released ("Failure to de-register
+ * a callback function may result in a crash of Domino or Notes") but not
+ * from the EM_TERMINATENSF callback.  The destructor runs when Domino
+ * unloads the extension libraries, which EM_TERMINATENSF announces.
+ *
+ * EMDeregister is only called if EM_TERMINATENSF was seen: otherwise the
+ * library is being torn down without an orderly NSF shutdown (crash, or
+ * exit before NSF termination) and calling into Notes is not safe.
+ * In processes other than smtp nothing was registered and this is a no-op.
+ * ----------------------------------------------------------------------- */
+__attribute__((destructor))
+static void SmtpTarpitUnload(void)
+{
+    STATUS err;
+
+    if (g_hReg == NULLHANDLE && g_hRegTerm == NULLHANDLE)
+        return;
+
+    if (!g_nsfTerminating)
+    {
+        UnloadTrace("unload without EM_TERMINATENSF, EMDeregister skipped");
+        return;
+    }
 
     if (g_hReg != NULLHANDLE)
     {
-        SmtpTarpitLogMessageText(LOG_DEBUG,
-                 "SMTP Tarpit [debug]: NSF terminating, deregistering EM_SMTPCONNECT");
-        EMDeregister(g_hReg);
+        UnloadTrace("EMDeregister(EM_SMTPCONNECT) ...");
+        err = EMDeregister(g_hReg);
         g_hReg = NULLHANDLE;
+        UnloadTrace("EMDeregister(EM_SMTPCONNECT) = 0x%04X", (unsigned)err);
     }
-    return ERR_EM_CONTINUE;
+    if (g_hRegTerm != NULLHANDLE)
+    {
+        UnloadTrace("EMDeregister(EM_TERMINATENSF) ...");
+        err = EMDeregister(g_hRegTerm);
+        g_hRegTerm = NULLHANDLE;
+        UnloadTrace("EMDeregister(EM_TERMINATENSF) = 0x%04X", (unsigned)err);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * One-time initialisation, run on the first EM_SMTPCONNECT (Notes is fully
+ * up by then): read notes.ini and log the "loaded" message.
+ * ----------------------------------------------------------------------- */
+static pthread_once_t g_initOnce = PTHREAD_ONCE_INIT;
+
+static void SmtpTarpitInitOnce(void)
+{
+    g_debugLevel  = (int)OSGetEnvironmentInt("DEBUG_SMTPTarpit");
+    g_tarpitDelay = (int)OSGetEnvironmentInt("SMTPTarpitDelay");
+    SmtpTarpitLogMessageText(LOG_INFO,
+             "SMTP Tarpit: extension version " VERSION " active (delay %d second(s))",
+             g_tarpitDelay);
+}
+
+static void SmtpTarpitLazyInit(void)
+{
+    pthread_once(&g_initOnce, SmtpTarpitInitOnce);
 }
 
 STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec)
@@ -937,6 +1034,8 @@ STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec)
     struct timespec tick;
     char           msgbuf[512];
     char           ipNorm[64];
+
+    SmtpTarpitLazyInit();
 
     SmtpTarpitLogMessageText(LOG_TRACE, "SMTP Tarpit [trace]: callback entered");
 
