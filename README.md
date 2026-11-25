@@ -11,7 +11,7 @@ The add-in registers a `EM_SMTPCONNECT` (before) hook. When an inbound SMTP conn
 Following the HCL C API rules for Extension Manager libraries:
 
 - the entry point only calls `EMCreateRecursionID` / `EMRegister` (no other C API calls while Domino is still initialising); `notes.ini` is read and the start-up message is logged on the first SMTP connection;
-- the hooks are deregistered when Domino unloads the library (library destructor, the Linux counterpart of `DLL_PROCESS_DETACH`), after the `EM_TERMINATENSF` notification — never from inside the `EM_TERMINATENSF` callback.
+- the hook is not deregistered with `EMDeregister`. On Linux, Domino doesn't unload the library with `dlclose()` while Notes is still running: the library is torn down during `exit()`, after Notes has already shut down the Extension Manager. An `EMDeregister` call from a library destructor at that point crashes the `smtp` task with SIGSEGV in `OSVBlockAddr` (fixed in 1.2.5). HCL also forbids deregistering from the `EM_TERMINATENSF` callback. The registration therefore ends when the process exits.
 
 ## Requirements
 
@@ -77,7 +77,7 @@ Reload the SMTP task:
 On the first incoming SMTP connection you should see this in the Domino console / log:
 
 ```
-SMTP Tarpit: extension version 1.2.4 active (delay 5 second(s))
+SMTP Tarpit: extension version 1.2.5 active (delay 5 second(s))
 ```
 
 The message is logged once per SMTP task start, by the `smtp` process only, and not at server start-up (see *How it works*).
@@ -119,9 +119,6 @@ DEBUG_SMTPTarpit=1
 ```
 
 The value is read once, on the first SMTP connection, and cached for the lifetime of the SMTP task. To change it, restart the SMTP task.
-
-With `DEBUG_SMTPTarpit` ≥ 1 the deregistration performed when the `smtp` task unloads the library is also traced to `/tmp/smtp-tarpit-unload.log` (plain file, since the Domino log may no longer be available at that point). Each `EMDeregister(...) ...` line should be followed by its `= 0x0000` result line.
-
 # Disclaimer
 
 The author is not responsible for any damage or malfunction caused by the extension and/or instructions provided.

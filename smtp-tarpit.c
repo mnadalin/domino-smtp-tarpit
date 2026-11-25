@@ -28,18 +28,20 @@
 #include "nif.h"
 #include "osmem.h"
 
-/* Extension Manager registrations, only ever made in the smtp process.
- * Both are released by the library destructor (SmtpTarpitUnload), after
- * EM_TERMINATENSF has announced the orderly unload. */
-static HEMREGISTRATION g_hReg           = NULLHANDLE;
-static HEMREGISTRATION g_hRegTerm       = NULLHANDLE;
-static volatile BOOL   g_nsfTerminating = FALSE;
+/* Extension Manager registration, only ever made in the smtp process.
+ *
+ * It is deliberately never released with EMDeregister.  On Linux Domino
+ * does not dlclose() the extension: the library is torn down by _dl_fini
+ * during exit(), after NotesTerm has already freed the Extension Manager
+ * pools, so calling EMDeregister from a library destructor dereferences a
+ * NULL VPool (SIGSEGV in OSVBlockAddr <- EMDeregister, seen on 14.5.1FP1).
+ * HCL forbids deregistering from the EM_TERMINATENSF callback, and there is
+ * no later point at which Notes is still usable; the registration dies with
+ * the process. */
+static HEMREGISTRATION g_hReg = NULLHANDLE;
 
 /* Name of the only process the extension is active in. */
 #define SMTP_PROCESS_NAME "smtp"
-
-/* Written by the destructor when DEBUG_SMTPTarpit >= 1. */
-#define UNLOAD_TRACE_FILE "/tmp/smtp-tarpit-unload.log"
 
 /* DEBUG_SMTPTarpit / SMTPTarpitDelay are read once from notes.ini on the
  * first SMTP connection (not in MainEntryPoint, see there) and cached for
@@ -48,7 +50,7 @@ static volatile BOOL   g_nsfTerminating = FALSE;
 static int g_debugLevel  = 0; /* LOG_INFO */
 static int g_tarpitDelay = 0;
 
-#define VERSION "1.2.4"
+#define VERSION "1.2.5"
 
 /* -----------------------------------------------------------------------
  * Server Configuration document fields (names.nsf).
@@ -817,7 +819,6 @@ static void SmtpFmtClientMsg(char *buf, size_t bufsz,
 }
 
 STATUS LNCALLBACK SmtpTarpitCallback(EMRECORD *pRec);
-STATUS LNCALLBACK SmtpTarpitTerminateCallback(EMRECORD *pRec);
 
 /* -----------------------------------------------------------------------
  * Return TRUE when running inside the Domino SMTP task.
@@ -890,114 +891,9 @@ STATUS LNPUBLIC MainEntryPoint(void)
         return err;
     }
 
-    /* Only used to learn that NSF is shutting down in an orderly way; the
-     * deregistration itself happens in the library destructor.  Not fatal
-     * if it fails: the destructor then skips EMDeregister (see below). */
-    err = EMRegister(EM_TERMINATENSF,
-                     EM_REG_BEFORE,
-                     (EMHANDLER)SmtpTarpitTerminateCallback,
-                     recursionID,
-                     &g_hRegTerm);
-    if (err != NOERROR)
-        g_hRegTerm = NULLHANDLE;
-
+    /* No EM_TERMINATENSF registration and no library destructor: see the
+     * comment on g_hReg for why EMDeregister must not be called on Linux. */
     return NOERROR;
-}
-
-/* -----------------------------------------------------------------------
- * EM_TERMINATENSF: "occurs when NSF service terminates for the process,
- * right before the extension manager DLLs are unloaded".
- *
- * HCL C API rule: "Do not de-register callback functions in the callback
- * routine for the EM_TERMINATENSF notification."  So this callback only
- * records that the orderly unload sequence has started; the registrations
- * are released by SmtpTarpitUnload() when the library is unloaded.
- * ----------------------------------------------------------------------- */
-STATUS LNCALLBACK SmtpTarpitTerminateCallback(EMRECORD *pRec)
-{
-    (void)pRec;
-    g_nsfTerminating = TRUE;
-    SmtpTarpitLogMessageText(LOG_DEBUG,
-             "SMTP Tarpit [debug]: EM_TERMINATENSF received, registrations "
-             "will be released when the library is unloaded");
-    return ERR_EM_CONTINUE;
-}
-
-/* -----------------------------------------------------------------------
- * Append one line to UNLOAD_TRACE_FILE (only when DEBUG_SMTPTarpit >= 1).
- * Uses plain libc on purpose: during unload the Notes logging API must not
- * be relied upon.  Used to verify on the server that the destructor runs
- * and EMDeregister returns.
- * ----------------------------------------------------------------------- */
-static void UnloadTrace(const char *fmt, ...)
-{
-    int     fd;
-    char    line[256];
-    int     n;
-    va_list ap;
-
-    if (g_debugLevel < LOG_DEBUG)
-        return;
-
-    n = snprintf(line, sizeof(line), "%ld pid=%ld ",
-                 (long)time(NULL), (long)getpid());
-    if (n < 0 || n >= (int)sizeof(line))
-        return;
-    va_start(ap, fmt);
-    vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
-    va_end(ap);
-
-    fd = open(UNLOAD_TRACE_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0)
-        return;
-    n = (int)strlen(line);
-    if (n < (int)sizeof(line) - 1) { line[n++] = '\n'; }
-    (void)!write(fd, line, (size_t)n);
-    close(fd);
-}
-
-/* -----------------------------------------------------------------------
- * Library destructor: the Linux counterpart of DLL_PROCESS_DETACH, which
- * is where the Windows C API samples call EMDeregister.
- *
- * HCL requires every registration to be released ("Failure to de-register
- * a callback function may result in a crash of Domino or Notes") but not
- * from the EM_TERMINATENSF callback.  The destructor runs when Domino
- * unloads the extension libraries, which EM_TERMINATENSF announces.
- *
- * EMDeregister is only called if EM_TERMINATENSF was seen: otherwise the
- * library is being torn down without an orderly NSF shutdown (crash, or
- * exit before NSF termination) and calling into Notes is not safe.
- * In processes other than smtp nothing was registered and this is a no-op.
- * ----------------------------------------------------------------------- */
-__attribute__((destructor))
-static void SmtpTarpitUnload(void)
-{
-    STATUS err;
-
-    if (g_hReg == NULLHANDLE && g_hRegTerm == NULLHANDLE)
-        return;
-
-    if (!g_nsfTerminating)
-    {
-        UnloadTrace("unload without EM_TERMINATENSF, EMDeregister skipped");
-        return;
-    }
-
-    if (g_hReg != NULLHANDLE)
-    {
-        UnloadTrace("EMDeregister(EM_SMTPCONNECT) ...");
-        err = EMDeregister(g_hReg);
-        g_hReg = NULLHANDLE;
-        UnloadTrace("EMDeregister(EM_SMTPCONNECT) = 0x%04X", (unsigned)err);
-    }
-    if (g_hRegTerm != NULLHANDLE)
-    {
-        UnloadTrace("EMDeregister(EM_TERMINATENSF) ...");
-        err = EMDeregister(g_hRegTerm);
-        g_hRegTerm = NULLHANDLE;
-        UnloadTrace("EMDeregister(EM_TERMINATENSF) = 0x%04X", (unsigned)err);
-    }
 }
 
 /* -----------------------------------------------------------------------
